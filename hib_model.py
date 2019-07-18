@@ -127,3 +127,128 @@ class HIB_model(torch.nn.Module):
         self.optimizer.step()
 
 
+
+class HIB_model_cnn(torch.nn.Module):
+
+    def __init__(self,input_size=5,z_dimension=2,beta=1e-3,lr=1e-3,device=0):
+        super(HIB_model_cnn,self).__init__()
+        self.device = device
+        self.input_size = input_size
+        self.z_dimension = z_dimension
+        self.beta = beta
+        self.lr = lr
+        self.enc = nn.Sequential(
+            nn.Conv2d(in_channels=1,              # input height
+                out_channels=16,            # n_filters
+                kernel_size=5,              # filter size
+                stride=1,                   # filter movement/step
+                padding=2,),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2),
+            nn.Conv2d(in_channels=16,  # input height
+                      out_channels=16,  # n_filters
+                      kernel_size=5,  # filter size
+                      stride=1,  # filter movement/step
+                      padding=2, ),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2),
+        )
+        self.enc_mu = nn.Linear(16*7*14, z_dimension)
+        self.enc_var_square = nn.Sequential(nn.Linear(16*7*14, z_dimension),nn.Softplus())
+
+        self.scalar_params = nn.Linear(1, 1)
+
+        params = (list(self.enc.parameters()) +
+                  list(self.enc_mu.parameters()) +
+                  list(self.enc_var_square.parameters())+list(self.scalar_params.parameters()))
+
+        self.cuda(self.device)
+        self.optimizer = optim.Adam(params, lr=self.lr)
+        self.num_z_sample = 8
+
+    def get_output(self,input):
+        input = torch.unsqueeze(input,1)
+        enc_data = self.enc(input)
+        enc_data = enc_data.view(enc_data.shape[0],-1)
+        mu = self.enc_mu(enc_data)
+        var = self.enc_var_square(enc_data)
+        return mu,var
+
+    def _product_of_gaussians(self,mu,var):
+        var = torch.clamp(var, min=1e-7)
+        var = 1. / torch.sum(torch.reciprocal(var), dim=0)
+        mu = var * torch.sum(mu / var, dim=0)
+        return mu, var
+
+
+
+    def cal_z(self,data):
+
+        z_mean,z_var_square = self.get_output(data)
+        return z_mean, z_var_square
+
+    def kl_loss(self,mean,var):
+        prior = torch.distributions.Normal(torch.zeros(self.z_dimension).cuda(self.device), torch.ones(self.z_dimension).cuda(self.device))
+        posteriors = [torch.distributions.Normal(mu, torch.sqrt(var)) for mu, var in
+                      zip(torch.unbind(mean), torch.unbind(var))]
+        kl_divs = [torch.distributions.kl.kl_divergence(post, prior) for post in posteriors]
+        kl_div_mean = torch.mean(torch.stack(kl_divs))
+        return kl_div_mean
+
+    def soft_z_loss(self,z_mean_1, z_var_1,z_mean_2, z_var_2,labels):
+        loss_1 = torch.zeros((z_mean_1.shape[0],1)).cuda(self.device)
+        loss_0 = torch.zeros((z_mean_1.shape[0], 1)).cuda(self.device)
+        for i in range(z_mean_1.shape[0]):
+            z1_dis = torch.distributions.Normal(z_mean_1[i,:],torch.sqrt(z_var_1[i,:],))
+            z1_sample = z1_dis.rsample((self.num_z_sample,)).cuda(self.device)
+            z2_dis = torch.distributions.Normal(z_mean_2[i, :], torch.sqrt(z_var_2[i, :], ))
+            z2_sample = z2_dis.rsample((self.num_z_sample,)).cuda(self.device)
+            loss1=torch.zeros((self.num_z_sample,self.num_z_sample)).cuda(self.device)
+            loss0=torch.zeros((self.num_z_sample,self.num_z_sample)).cuda(self.device)
+            for j in range(self.num_z_sample):
+                for k in range(self.num_z_sample):
+                    dis = torch.norm(z1_sample[j,:]-z2_sample[k,:]).cuda(self.device)
+                    possibility = torch.sigmoid(-1*F.softplus(self.scalar_params.weight)*dis+self.scalar_params.bias).cuda(self.device)
+                    loss1[j,k]=-1*torch.log(possibility)
+                    loss0[j,k]-1*torch.log(1-possibility)
+            loss_1[i,0] = torch.mean(loss1)
+            loss_0[i, 0] = torch.mean(loss0)
+        loss = torch.mean(loss_1 * labels + loss_0 * (1-labels))
+        return loss
+
+
+    def cal_loss(self,batch1,batch2,labels):
+        z_mean_1, z_var_1 = self.cal_z(batch1)
+        z_mean_2, z_var_2 = self.cal_z(batch2)
+        loss = (self.kl_loss(z_mean_1,z_var_1) + self.kl_loss(z_mean_2, z_var_2))*self.beta
+        loss = loss + self.soft_z_loss(z_mean_1, z_var_1,z_mean_2, z_var_2,labels)
+        return loss
+
+
+    def _confidence(self,mean,var):
+        poss_total = torch.zeros((mean.shape[0],1)).cuda(self.device)
+        for i in range(mean.shape[0]):
+            z_dis = torch.distributions.Normal(mean[i, :], torch.sqrt(var[i, :], ))
+            z1_sample = z_dis.rsample((self.num_z_sample,)).cuda(self.device)
+            z2_sample = z_dis.rsample((self.num_z_sample,)).cuda(self.device)
+            poss = torch.zeros((self.num_z_sample, self.num_z_sample)).cuda(self.device)
+            for j in range(self.num_z_sample):
+                for k in range(self.num_z_sample):
+                    dis = torch.norm(z1_sample[j, :] - z2_sample[k, :]).cuda(self.device)
+                    possibility = torch.sigmoid(
+                        -1 * F.softplus(self.scalar_params.weight) * dis + self.scalar_params.bias).cuda(self.device)
+                    poss[j, k] = possibility
+
+            poss_total[i, 0] = torch.mean(poss)
+
+        return poss_total
+
+    def cal_confidence(self,batch):#(batch_size,obs_dim,tra_len)
+        z_mean, z_var = self.cal_z(batch)
+        confidence = self._confidence(z_mean,z_var)
+        return confidence
+
+    def optimize(self,loss):
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
