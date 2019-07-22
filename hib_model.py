@@ -130,8 +130,9 @@ class HIB_model(torch.nn.Module):
 
 class HIB_model_cnn(torch.nn.Module):
 
-    def __init__(self,input_size=5,z_dimension=2,beta=1e-3,lr=1e-3,device=0):
+    def __init__(self,input_size=5,z_dimension=2,beta=1e-3,lr=1e-3,device=0,hard=True):
         super(HIB_model_cnn,self).__init__()
+        self.hard = hard
         self.device = device
         self.input_size = input_size
         self.z_dimension = z_dimension
@@ -209,6 +210,8 @@ class HIB_model_cnn(torch.nn.Module):
                 for k in range(self.num_z_sample):
                     dis = torch.norm(z1_sample[j,:]-z2_sample[k,:]).cuda(self.device)
                     possibility = torch.sigmoid(-1*F.softplus(self.scalar_params.weight)*dis+self.scalar_params.bias).cuda(self.device)
+                    possibility = torch.sigmoid(
+                        -1  * dis ).cuda(self.device)
                     loss1[j,k]=-1*torch.log(possibility)
                     loss0[j,k]-1*torch.log(1-possibility)
             loss_1[i,0] = torch.mean(loss1)
@@ -217,11 +220,22 @@ class HIB_model_cnn(torch.nn.Module):
         return loss
 
 
+
+    def hard_z_loss(self,z_mean_1, z_var_1,z_mean_2, z_var_2,labels):
+        delta_z_distribution = torch.distributions.Normal(z_mean_1-z_mean_2,torch.sqrt(z_var_1+z_var_2))
+        log_prob_1 = delta_z_distribution.log_prob(0)
+        log_prob_0 = torch.log(1-torch.exp(log_prob_1))
+        loss = -1*torch.mean(labels*log_prob_1+(1-labels)*log_prob_0)
+        return loss
+
     def cal_loss(self,batch1,batch2,labels):
         z_mean_1, z_var_1 = self.cal_z(batch1)
         z_mean_2, z_var_2 = self.cal_z(batch2)
         loss = (self.kl_loss(z_mean_1,z_var_1) + self.kl_loss(z_mean_2, z_var_2))*self.beta
-        loss = loss + self.soft_z_loss(z_mean_1, z_var_1,z_mean_2, z_var_2,labels)
+        if self.hard:
+            loss = loss + self.hard_z_loss(z_mean_1, z_var_1,z_mean_2, z_var_2,labels)
+        else:
+            loss = loss + self.soft_z_loss(z_mean_1, z_var_1, z_mean_2, z_var_2, labels)
         return loss
 
 
